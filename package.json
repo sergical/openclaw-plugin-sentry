@@ -1,0 +1,39 @@
+{
+  "name": "openclaw-plugin-sentry",
+  "version": "0.1.0",
+  "description": "Sentry integration for OpenClaw — errors, traces, and structured logs",
+  "license": "MIT",
+  "author": "Sergiy Dybskiy <s@serg.tech>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sergical/openclaw-plugin-sentry"
+  },
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "sentry",
+    "observability",
+    "tracing",
+    "logging",
+    "error-tracking",
+    "ai-agent",
+    "genai"
+  ],
+  "dependencies": {
+    "@sentry/node": "^10.39.0"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.2.0"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "files": [
+    "index.ts",
+    "openclaw.plugin.json",
+    "README.md",
+    "LICENSE"
+  ]
+}
