@@ -24,24 +24,24 @@ export function createSentryService(): OpenClawPluginService {
       }
 
       // ── 1. Init Sentry SDK ──────────────────────────────────
-      const enableLogs = pluginCfg?.enableLogs !== false;
+      const enableLogs = pluginCfg?.enableLogs !== false; // default true
       Sentry.init({
         dsn,
         environment: pluginCfg?.environment ?? "production",
         tracesSampleRate: pluginCfg?.tracesSampleRate ?? 1.0,
-        enableLogs,
+        enableLogs, // top-level in Sentry SDK v10+
       });
 
       ctx.logger.info(
         `sentry: initialized (dsn=...${dsn.slice(-12)}, env=${pluginCfg?.environment ?? "production"}, logs=${enableLogs})`,
       );
 
-      // ── 2. Diagnostic events → Sentry spans ────────────────
+      // ── 2. Diagnostic events → Sentry spans + messages ─────
       unsubDiag = onDiagnosticEvent((evt: DiagnosticEventPayload) => {
         try {
-          handleDiagnosticEvent(evt, ctx.logger);
-        } catch (err) {
-          ctx.logger.warn(`sentry: diagnostic handler error: ${err}`);
+          handleDiagnosticEvent(evt);
+        } catch {
+          // Don't let telemetry errors affect the gateway
         }
       });
       ctx.logger.info("sentry: subscribed to diagnostic events");
@@ -69,34 +69,30 @@ export function createSentryService(): OpenClawPluginService {
   };
 }
 
-// ── Diagnostic events → spans ───────────────────────────────
+// ── Diagnostic events → spans / messages ────────────────────
 
-function handleDiagnosticEvent(
-  evt: DiagnosticEventPayload,
-  logger: { info: (...args: any[]) => void; warn: (...args: any[]) => void },
-): void {
+function handleDiagnosticEvent(evt: DiagnosticEventPayload): void {
   switch (evt.type) {
     case "model.usage":
       recordModelUsage(evt);
       return;
-
     case "message.processed":
       recordMessageProcessed(evt);
       return;
-
     case "webhook.error":
       Sentry.captureMessage(`Webhook error: ${evt.error}`, {
         level: "error",
         tags: { channel: evt.channel, updateType: evt.updateType },
       });
       return;
-
     case "session.stuck":
       Sentry.captureMessage(`Session stuck: ${evt.sessionKey} (${evt.ageMs}ms)`, {
         level: "warning",
         tags: { sessionKey: evt.sessionKey, state: evt.state },
       });
       return;
+    // Silently ignore event types we don't handle (webhook.received,
+    // session.state, queue.lane.*, diagnostic.heartbeat, etc.)
   }
 }
 
@@ -107,11 +103,10 @@ function recordModelUsage(
 ): void {
   const spanName = evt.model ? `chat ${evt.model}` : "chat unknown";
   const endTimeMs = evt.ts;
-  const durationMs = evt.durationMs ?? 100; // fallback to 100ms if missing
+  const durationMs = evt.durationMs ?? 100;
   const startTimeMs = endTimeMs - durationMs;
 
-  // Use startInactiveSpan so we control start + end timestamps
-  // Sentry v10 accepts ms, Date objects, or [sec, ns] tuples — NOT seconds
+  // startInactiveSpan with explicit timestamps (Sentry v10 accepts ms)
   const span = Sentry.startInactiveSpan({
     op: "ai.chat",
     name: spanName,
@@ -124,7 +119,7 @@ function recordModelUsage(
       "gen_ai.request.model": evt.model ?? "unknown",
       "gen_ai.usage.input_tokens": evt.usage.input ?? 0,
       "gen_ai.usage.output_tokens": evt.usage.output ?? 0,
-      // OpenClaw-specific context
+      // OpenClaw context
       "openclaw.channel": evt.channel ?? "unknown",
       "openclaw.session_key": evt.sessionKey ?? "unknown",
       "openclaw.tokens.cache_read": evt.usage.cacheRead ?? 0,
@@ -135,9 +130,7 @@ function recordModelUsage(
     },
   });
 
-  if (span) {
-    span.end(endTimeMs);
-  }
+  span?.end(endTimeMs);
 }
 
 // ── Message processed → openclaw.message span ───────────────
@@ -187,34 +180,37 @@ function forwardLog(logObj: Record<string, unknown>): void {
 
   const level = (meta?.logLevelName ?? "INFO").toLowerCase();
 
-  // Extract positional args (numeric keys from the log transport format)
-  const numericArgs = Object.entries(logObj)
+  // OpenClaw log transport format: numeric keys are positional args.
+  // Typically: "0" = subsystem/context tag, "1" = message string
+  const numericEntries = Object.entries(logObj)
     .filter(([key]) => /^\d+$/.test(key))
-    .toSorted((a, b) => Number(a[0]) - Number(b[0]))
-    .map(([, value]) => value);
+    .sort((a, b) => Number(a[0]) - Number(b[0]));
 
-  // Last string arg is typically the message
+  let subsystem = "";
   let message = "";
-  if (numericArgs.length > 0 && typeof numericArgs[numericArgs.length - 1] === "string") {
-    message = String(numericArgs.pop());
-  } else if (numericArgs.length === 1) {
-    message = String(numericArgs[0]);
-    numericArgs.length = 0;
+
+  if (numericEntries.length >= 2) {
+    // First arg is usually the subsystem tag, last is the message
+    subsystem = String(numericEntries[0][1]);
+    const lastVal = numericEntries[numericEntries.length - 1][1];
+    message = typeof lastVal === "string" ? lastVal : JSON.stringify(lastVal);
+  } else if (numericEntries.length === 1) {
+    const val = numericEntries[0][1];
+    message = typeof val === "string" ? val : JSON.stringify(val);
   }
+
   if (!message) message = "log";
 
   const loggerName = meta?.name ?? "openclaw";
 
-  // Sentry.logger is available in SDK v9 with _experiments.enableLogs
   const loggerApi = Sentry.logger;
   if (!loggerApi) return;
 
-  // Build attributes object for structured log
-  const attrs: Record<string, unknown> = {
+  const attrs: Record<string, string> = {
     "openclaw.logger": loggerName,
   };
-  if (numericArgs.length > 0) {
-    attrs["openclaw.args"] = JSON.stringify(numericArgs);
+  if (subsystem) {
+    attrs["openclaw.subsystem"] = subsystem;
   }
 
   // Route to appropriate Sentry log level
